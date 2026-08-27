@@ -1,0 +1,1 @@
+vio-euroc/results/MH_01_easy/fase4_videos/*.mp4 filter=lfs diff=lfs merge=lfs -text
