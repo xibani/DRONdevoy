@@ -27,6 +27,7 @@ expongas a Internet: /api/explorar lista el sistema de archivos local.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -111,8 +112,12 @@ def _correr(tid: str, cmd: list[str]) -> None:
     tr = TRABAJOS[tid]
     tr.update(estado="corriendo", inicio=time.time())
     try:
+        # UTF-8 explícito en ambos lados: en Windows el hijo y el padre no
+        # comparten codificación por defecto y los acentos del log se rompen.
         proc = subprocess.Popen(cmd, cwd=RAIZ, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                encoding="utf-8", errors="replace",
+                                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         tr["pid"] = proc.pid
         for linea in proc.stdout:               # streaming al log en memoria
             with _LOCK:
