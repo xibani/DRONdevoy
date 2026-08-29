@@ -117,3 +117,20 @@ posición absoluta (deriva tipo random walk, esperada y medida). El back-end
 tightly-coupled (MSCKF de la 6A / grafo iSAM2 de la 6B) es el siguiente módulo
 a portar; la interfaz ya está preparada: `construir_medidas` produce las
 mismas medidas y el `resultado.npz` mantiene el contrato entre fases.
+
+## Interfaz gráfica (opcional)
+
+`servidor_api.py` expone toda la lógica como API REST local para una interfaz
+web (el prompt para generarla con Lovable/Stitch está en
+`prompt_interfaz_atalaya.md`):
+
+```bash
+pip install fastapi "uvicorn[standard]"
+python servidor_api.py           # http://localhost:8420
+```
+
+Endpoints: `/api/estado`, `/api/configs` (leer/guardar/editar campo),
+`/api/trabajos` (lanza selftest/inspeccionar/extraer-frames/offset/ejecutar
+como subprocesos con log en vivo), `/api/resultados` (sirve PNGs/TUM/npz) y
+`/api/explorar` (selector de archivos). Solo para localhost: no lo expongas a
+Internet.
