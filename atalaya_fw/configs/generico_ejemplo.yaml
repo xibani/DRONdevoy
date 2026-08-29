@@ -1,0 +1,34 @@
+# ATALAYA — CSVs arbitrarios (mapeo de columnas y unidades configurable)
+dataset:
+  tipo: generico
+  imu_csv: datos/imu.csv
+  imu_columnas: {t: time_us, wx: gx, wy: gy, wz: gz, ax: ax, ay: ay, az: az}
+  unidades: {t: us, gyro: deg_s, accel: m_s2}   # t: s|ms|us|ns; gyro: rad_s|deg_s; accel: m_s2|g
+  directorio_frames: datos/frames               # con data.csv (t_ns, filename)
+  camara:
+    video: datos/video.mp4                      # para `extraer-frames`
+    directorio_frames: datos/frames
+    timestamps: fps
+    fps: 20.0
+    t0: 0.0
+    offset_temporal_s: 0.0
+  gt_csv: datos/gt.csv                          # opcional
+  gt_columnas: {t: t, px: x, py: y, pz: z, qw: qw, qx: qx, qy: qy, qz: qz}
+
+camara:
+  modelo: radtan
+  intrinsecos: [458.0, 458.0, 376.0, 240.0]
+  distorsion: [-0.28, 0.07, 1.0e-4, 1.0e-5]
+  resolucion: [752, 480]
+  T_body_cam: null                              # null = identidad
+
+imu:
+  rate_hz: 200
+  sigma_g: 1.7e-4
+  sigma_a: 2.0e-3
+  sigma_bg: 2.0e-5
+  sigma_ba: 3.0e-3
+
+eskf: {modo: direccion, factor_q: 4.0}
+inicializacion: {tipo: estatica}
+salida: {directorio: results/mis_datos}

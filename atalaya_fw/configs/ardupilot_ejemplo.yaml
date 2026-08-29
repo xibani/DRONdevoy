@@ -1,0 +1,53 @@
+# ATALAYA — vuelo propio: log DataFlash de ArduPilot + vídeo de la cámara.
+# Flujo: 1) atalaya inspeccionar  2) atalaya extraer-frames
+#        3) atalaya offset        4) poner el offset aquí  5) atalaya ejecutar
+dataset:
+  tipo: ardupilot
+  log: vuelos/vuelo01.BIN
+  imu:
+    mensaje: IMU                 # "IMU" (filtrado) o "GYR+ACC" (raw, más Hz)
+    instancia: 0                 # qué IMU del autopiloto (campo I del mensaje)
+  gt:
+    fuente: att_pos              # ATT+POS del EKF3 | "ninguna"
+                                 # OJO: es el EKF del autopiloto, no un mocap.
+  camara:
+    video: vuelos/vuelo01.mp4
+    directorio_frames: vuelos/vuelo01_frames
+    timestamps: fps              # "fps" | "csv" | "cam_msg" (triggers CAM/TRIG)
+    fps: 30.0
+    t0: 12.5                     # s (base TimeUS del log) del PRIMER frame
+    # csv: vuelos/stamps.csv     # si timestamps: csv
+    cada_n: 1                    # submuestreo del vídeo
+    offset_temporal_s: 0.0       # <- resultado de `atalaya offset`
+
+camara:                          # calibra con OpenCV/Kalibr y pega aquí
+  modelo: radtan                 # "radtan" | "fisheye"
+  intrinsecos: [458.0, 458.0, 376.0, 240.0]    # fu, fv, cu, cv
+  distorsion: [-0.28, 0.07, 1.0e-4, 1.0e-5]
+  resolucion: [752, 480]
+  T_body_cam:                    # p_body = T_body_cam @ p_cam (como T_BS EuRoC)
+    - [0.0,  0.0, 1.0, 0.10]    #   body = FRD del autopiloto
+    - [1.0,  0.0, 0.0, 0.00]    #   ejemplo: cámara mirando adelante
+    - [0.0,  1.0, 0.0, 0.02]
+    - [0.0,  0.0, 0.0, 1.0]
+
+imu:                             # densidades de ruido de TU IMU (Allan o datasheet)
+  rate_hz: 200
+  sigma_g: 1.7e-4
+  sigma_a: 2.0e-3
+  sigma_bg: 2.0e-5
+  sigma_ba: 3.0e-3
+
+frontend:
+  paralaje_min: 2.0
+
+eskf:
+  modo: direccion
+  factor_q: 4.0                  # sube a 6-10 si el dron vibra mucho
+
+inicializacion:
+  tipo: estatica                 # deja el dron QUIETO unos segundos al armar
+  t_estatico_max: 10.0
+
+salida:
+  directorio: results/vuelo01

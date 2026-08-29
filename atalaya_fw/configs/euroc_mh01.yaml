@@ -1,0 +1,23 @@
+# ATALAYA — EuRoC MH_01_easy (referencia contra las fases del curso)
+dataset:
+  tipo: euroc
+  raiz: data/MH_01_easy          # carpeta que contiene mav0/
+  # camara_euroc: cam0
+
+frontend:
+  paralaje_min: 2.0              # px, DEROTADO
+  kf_min: 2
+  kf_max: 8
+  min_comunes: 40
+
+eskf:
+  modo: direccion                # "direccion" (defecto) | "escala"
+  factor_q: 4.0                  # los sigma del YAML de EuRoC son optimistas
+  # t_ini: 40.0                  # ventana opcional [s]
+  # t_fin: 110.0
+
+inicializacion:
+  tipo: gt                       # con GT: fija el marco y permite ATE SE(3)
+
+salida:
+  directorio: results/MH_01_easy/framework
