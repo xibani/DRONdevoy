@@ -1,0 +1,54 @@
+{
+  "sesion": "20261017_113325",
+  "video": "sesiones\\20261017_113325\\video.mp4",
+  "dispositivo": "cuda",
+  "K": [
+    [
+      816.0,
+      0.0,
+      479.5
+    ],
+    [
+      0.0,
+      816.0,
+      359.5
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "fotogramas_procesados": 2645,
+  "keyframes": 1197,
+  "puntos_3d": 295066,
+  "estados": {
+    "ok": 889,
+    "perdido_imu": 10,
+    "rotacion": 297,
+    "inicio": 1
+  },
+  "parametros": {
+    "entrada": "sesiones\\20261017_113325",
+    "start": 0,
+    "end": null,
+    "step": 1,
+    "max_kpts": 2048,
+    "resize": null,
+    "min_flow": 10.0,
+    "max_gap": 20,
+    "min_inliers": 40,
+    "min_parallax": 1.0,
+    "fx": null,
+    "fy": null,
+    "cx": null,
+    "cy": null,
+    "out": null,
+    "fps_anim": 12.0,
+    "gif_frames": 160,
+    "gif_width": 760,
+    "cpu": false,
+    "sin_imu": false
+  },
+  "aviso": "Escala métrica no observable (monocular); orientación afectada por posible EIS."
+}
