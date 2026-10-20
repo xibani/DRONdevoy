@@ -1,0 +1,87 @@
+{
+  "video": ".\\sesiones\\20261017_113325\\video.mp4",
+  "frame_1": 1,
+  "frame_2": 4,
+  "seconds_between_frames": 0.1,
+  "intrinsics_approximate": true,
+  "K": [
+    [
+      816.0,
+      0.0,
+      479.5
+    ],
+    [
+      0.0,
+      816.0,
+      359.5
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "initial_matches": 277,
+  "inliers_ransac": 269,
+  "inlier_ratio": 0.9711191335740073,
+  "E": [
+    [
+      -0.007723373436663442,
+      0.37211623749537265,
+      -0.5711252404452045
+    ],
+    [
+      -0.3761748283656515,
+      -0.0029510519043607986,
+      -0.18420994033028518
+    ],
+    [
+      0.5685425923783702,
+      0.19119769640859277,
+      -0.0062501393124761795
+    ]
+  ],
+  "R_2_from_1": [
+    [
+      0.9999357575493243,
+      0.005893075386344275,
+      -0.009682584197946868
+    ],
+    [
+      -0.0059311440441459865,
+      0.9999747755318648,
+      -0.003907663025876309
+    ],
+    [
+      0.0096593118071143,
+      0.003964840789624486,
+      0.99994548738065
+    ]
+  ],
+  "t_2_from_1_unit": [
+    -0.2656532138764837,
+    0.8056680304942515,
+    0.5294595306504635
+  ],
+  "camera_2_center_in_camera_1_units": [
+    0.26530046610781804,
+    -0.8061814162742684,
+    -0.5288545988615292
+  ],
+  "relative_camera_2_rpy_degrees": [
+    -0.22390366500281558,
+    0.5547798782136043,
+    0.3376661314136954
+  ],
+  "positive_depth_in_sample": 52,
+  "sample_depth_checked": 100,
+  "positive_depth_in_all_inliers": 129,
+  "triangulated_total": 269,
+  "points_after_reprojection_and_parallax_filter": 0,
+  "plotted_3d_points": 0,
+  "median_parallax_deg_positive": 0.015372936086285295,
+  "median_reprojection_error_px_positive": 3.338756591540954,
+  "median_epipolar_distance_sample_px": 6.594205379945053,
+  "min_parallax_for_visualization_deg": 0.2,
+  "warning": "La EIS y una K aproximada pueden afectar el resultado. Traslacion solo conocida hasta escala y pose potencialmente degenerada."
+}

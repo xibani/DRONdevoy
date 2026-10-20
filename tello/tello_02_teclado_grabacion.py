@@ -65,7 +65,13 @@ os.makedirs(carpeta, exist_ok=True)
 # ----------------------------------------------------------------------
 tello = Tello()
 tello.connect()  # envia "command" y espera "ok"
-print(f"Bateria: {tello.get_battery()} %")
+bateria_inicial = tello.get_battery()
+print(f"Bateria: {bateria_inicial} %")
+if bateria_inicial < BATERIA_MINIMA:
+    print(
+        f"AVISO: bateria por debajo de {BATERIA_MINIMA}%. El Tello rechazara "
+        f"'takeoff'. Puedes ver video y grabar en tierra, pero no volar."
+    )
 
 tello.streamon()
 lector_frames = tello.get_frame_read()  # hilo interno que decodifica video
@@ -160,9 +166,42 @@ def cerrar_grabacion():
 
 
 # ----------------------------------------------------------------------
-# Paso 5: bucle principal
+# Paso 5: despegue en un hilo propio
+# ----------------------------------------------------------------------
+# takeoff tarda varios segundos en responder "ok". Si se espera en el bucle
+# principal, durante ese tiempo no hay video ni teclado (ni EMERGENCIA).
+despegando = threading.Event()
+cancelar_despegue = threading.Event()  # se activa si hay emergencia
+hilo_despegue = None
+
+
+def hilo_despegar():
+    global volando
+    try:
+        # Un solo intento a proposito: tello.takeoff() reintenta hasta 3
+        # veces si no recibe "ok", y podria volver a despegar despues de
+        # una emergencia
+        respuesta = tello.send_command_with_return(
+            "takeoff", timeout=Tello.TAKEOFF_TIMEOUT
+        )
+        if cancelar_despegue.is_set():
+            print("Despegue cancelado por emergencia")
+        elif "ok" in respuesta.lower():
+            tello.is_flying = True
+            volando = True
+        else:
+            print(f"Despegue rechazado: {respuesta}")
+    except Exception as e:
+        print(f"Despegue rechazado: {e}")
+    finally:
+        despegando.clear()
+
+
+# ----------------------------------------------------------------------
+# Paso 6: bucle principal
 # ----------------------------------------------------------------------
 volando = False
+aterrizar_pendiente = False  # 'l' pulsada mientras despegaba
 comando = [0, 0, 0, 0]  # lr, fb, ud, yaw
 t_fin_pulso = 0.0
 t_ultimo_rc = 0.0
@@ -172,7 +211,7 @@ try:
     while True:
         ahora = time.monotonic()
 
-        # --- 5.1 Video: detectar frame nuevo por identidad del array ---
+        # --- 6.1 Video: detectar frame nuevo por identidad del array ---
         frame = lector_frames.frame
         if frame is not None and frame is not frame_anterior:
             frame_anterior = frame
@@ -203,25 +242,44 @@ try:
                 cv2.circle(vista, (vista.shape[1] - 30, 30), 12, (0, 0, 255), -1)
             cv2.imshow("Tello", vista)
 
-        # --- 5.2 Teclado ---
+        # --- 6.2 Teclado ---
         tecla = cv2.waitKey(1) & 0xFF
         nuevo = None
         if tecla == 27:  # ESC
             break
         elif tecla == ord(" "):
-            # Emergencia: corta motores inmediatamente
+            # Emergencia: corta motores inmediatamente. No espera respuesta,
+            # asi que funciona tambien en mitad del despegue
+            if despegando.is_set():
+                cancelar_despegue.set()
             try:
                 tello.emergency()
             except Exception as e:
                 print(f"emergency: {e}")
             volando = False
-        elif tecla == ord("t") and not volando:
-            tello.takeoff()  # bloquea hasta "ok"
-            volando = True
-        elif tecla == ord("l") and volando:
-            tello.send_rc_control(0, 0, 0, 0)
-            tello.land()
-            volando = False
+            aterrizar_pendiente = False
+        elif tecla == ord("t") and not volando and not despegando.is_set():
+            # Comprobar bateria antes: el Tello rechaza el despegue con
+            # bateria baja respondiendo simplemente "error"
+            bat_actual = tello.get_current_state().get("bat")
+            if bat_actual is not None and float(bat_actual) < BATERIA_MINIMA:
+                print(f"Bateria {bat_actual}% < {BATERIA_MINIMA}%: no se despega")
+            else:
+                cancelar_despegue.clear()
+                despegando.set()
+                hilo_despegue = threading.Thread(target=hilo_despegar, daemon=True)
+                hilo_despegue.start()
+                print("Despegando... (ESPACIO = emergencia)")
+        elif tecla == ord("l"):
+            if despegando.is_set():
+                # Durante el despegue el Tello ignora otros comandos:
+                # aterrizar en cuanto termine
+                aterrizar_pendiente = True
+                print("Aterrizaje pendiente: se hara al terminar el despegue")
+            elif volando:
+                tello.send_rc_control(0, 0, 0, 0)
+                tello.land()
+                volando = False
         elif tecla == ord("g"):
             if grabando.is_set():
                 grabando.clear()
@@ -252,14 +310,20 @@ try:
         elif ahora > t_fin_pulso:
             comando = [0, 0, 0, 0]  # sin tecla: hover
 
-        # --- 5.3 Envio de rc a frecuencia fija (tambien hace de keep-alive) ---
+        if volando and aterrizar_pendiente:
+            aterrizar_pendiente = False
+            tello.send_rc_control(0, 0, 0, 0)
+            tello.land()
+            volando = False
+
+        # --- 6.3 Envio de rc a frecuencia fija (tambien hace de keep-alive) ---
         if volando and ahora - t_ultimo_rc >= PERIODO_RC_S:
             tello.send_rc_control(*comando)
             t_ultimo_rc = ahora
             if grabando.is_set() and escritor_cmd is not None:
                 escritor_cmd.writerow([ahora] + comando)
 
-        # --- 5.4 Seguridad por bateria ---
+        # --- 6.4 Seguridad por bateria ---
         bat = tello.get_current_state().get("bat")
         if volando and bat is not None and float(bat) < BATERIA_MINIMA:
             print("Bateria baja: aterrizando")
@@ -269,8 +333,12 @@ try:
 
 finally:
     # ------------------------------------------------------------------
-    # Paso 6: cierre ordenado
+    # Paso 7: cierre ordenado
     # ------------------------------------------------------------------
+    if hilo_despegue is not None and despegando.is_set():
+        # Salir en mitad del despegue: esperar a que acabe para aterrizar
+        print("Esperando a que termine el despegue para aterrizar...")
+        hilo_despegue.join(timeout=Tello.TAKEOFF_TIMEOUT)
     if volando:
         try:
             tello.send_rc_control(0, 0, 0, 0)
