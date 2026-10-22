@@ -26,10 +26,10 @@
   "planos": 465,
   "saltos_rotacion_imu": 98,
   "estados": {
-    "perdido_imu": 10,
-    "ok": 886,
     "rotacion": 294,
-    "inicio": 1
+    "inicio": 1,
+    "perdido_imu": 10,
+    "ok": 886
   },
   "parametros": {
     "entrada": "sesiones\\20261017_113325",
