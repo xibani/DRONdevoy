@@ -20,12 +20,15 @@
     ]
   ],
   "fotogramas_procesados": 2645,
-  "keyframes": 1197,
-  "puntos_3d": 295066,
+  "keyframes": 1191,
+  "puntos_3d": 284357,
+  "puntos_densos": 1430576,
+  "planos": 465,
+  "saltos_rotacion_imu": 98,
   "estados": {
-    "ok": 889,
     "perdido_imu": 10,
-    "rotacion": 297,
+    "ok": 886,
+    "rotacion": 294,
     "inicio": 1
   },
   "parametros": {
@@ -48,7 +51,23 @@
     "gif_frames": 160,
     "gif_width": 760,
     "cpu": false,
-    "sin_imu": false
+    "sin_imu": false,
+    "imu_max_err": 4.0,
+    "zancada": 0.65,
+    "sin_andar_horizontal": false,
+    "sin_podometro": false,
+    "imu_alpha": 0.05,
+    "denso": true,
+    "denso_cada": 4,
+    "denso_paso": 8,
+    "planos": true,
+    "voxel": null
   },
-  "aviso": "Escala métrica no observable (monocular); orientación afectada por posible EIS."
+  "podometro": {
+    "pasos": 132,
+    "zancada_m": 0.65,
+    "distancia_m": 85.8
+  },
+  "recorrido": 88.914,
+  "aviso": "Escala en metros vía podómetro: depende de --zancada (error típico 10-20 %)."
 }

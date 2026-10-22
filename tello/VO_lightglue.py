@@ -21,9 +21,11 @@ Flujo por pares de keyframes:
      usa la de la IMU y t se recalcula con R fija; además, en cada keyframe la
      orientación se acerca un --imu-alpha a la de la IMU (filtro complementario).
      El mundo queda nivelado con la gravedad (z hacia arriba en las gráficas).
-  5. Triangulación de los inliers. La escala relativa entre pasos se obtiene
-     comparando la profundidad de los puntos compartidos con el paso anterior,
-     de modo que la trayectoria es coherente (aunque sigue sin escala métrica).
+  5. Triangulación de los inliers. Escala: si se está andando, la línea base del
+     paso son los metros que marca el podómetro de la IMU (podometro.py, ajustable
+     con --zancada); parado, se propaga la escala relativa comparando la
+     profundidad de los puntos compartidos con el paso anterior. Los pasos sin
+     traslación visual (rotación pura, pérdidas) también avanzan lo andado.
   6. Si el paralaje es casi nulo se trata como rotación pura (t = 0).
   7. Con --denso, 1 de cada --denso-cada keyframes se densifica con Depth
      Anything V2 escalado a la VO (ver densificar.py) y se fusiona por vóxeles.
@@ -58,12 +60,14 @@ from plotly.subplots import make_subplots
 
 from densificar import Densificador, fusionar_voxeles
 from planos import MapaPlanos, detectar_planos
+from podometro import crear_podometro
 
 HERE = Path(__file__).resolve().parent
 
 # Cámara (x derecha, y abajo, z adelante) -> mundo de visualización (x derecha,
 # y adelante, z arriba), tomando como referencia la cámara del primer keyframe.
 CAM_TO_PLOT = np.array([[1.0, 0, 0], [0, 0, 1.0], [0, -1.0, 0]])
+UP_WORLD = CAM_TO_PLOT.T @ np.array([0, 0, 1.0])  # "arriba" en coordenadas de mundo
 
 
 # --------------------------------------------------------------------------
@@ -276,10 +280,11 @@ class Step:
     inlier_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
     dense_points: int = 0
     rot_imu: bool = False  # la rotación de este paso se tomó de la IMU (salto de la VO)
+    avance_pod: float = 0.0  # metros andados en este paso según el podómetro
 
 
 class LightGlueVO:
-    def __init__(self, args, device, imu_att=None, densificador=None):
+    def __init__(self, args, device, imu_att=None, densificador=None, podometro=None):
         self.args = args
         self.device = device
         self.imu_att = imu_att  # t_rel -> R_wc según la IMU (mundo nivelado), o None
@@ -287,10 +292,16 @@ class LightGlueVO:
         self.dense_P: list[np.ndarray] = []
         self.dense_C: list[np.ndarray] = []
         self.dense_owner: list[np.ndarray] = []
-        self.dense_z: list[float] = []  # profundidad mediana de cada keyframe densificado
-        self.dense_plane: list[np.ndarray] = []  # id de plano global por punto (-1 = ninguno)
+        self.dense_z: list[float] = (
+            []
+        )  # profundidad mediana de cada keyframe densificado
+        self.dense_plane: list[np.ndarray] = (
+            []
+        )  # id de plano global por punto (-1 = ninguno)
         self.mapa_planos = MapaPlanos() if getattr(args, "planos", False) else None
         self._kf_sin_denso = 0
+        self.podometro = podometro  # distancia andada [m] -> línea base métrica, o None
+        self.dir_w = None  # última dirección de avance en el mundo (para pasos sin t)
         self.extractor = SuperPoint(max_num_keypoints=args.max_kpts).eval().to(device)
         self.matcher = LightGlue(features="superpoint").eval().to(device)
         self.K = None
@@ -333,6 +344,9 @@ class LightGlueVO:
                 T0[:3, :3] = self.imu_att(t_rel)  # mundo nivelado con la gravedad
             self._new_keyframe(idx, t_rel, feats, kpts, bgr, T0, 1.0)
             self.steps.append(Step(idx, t_rel, T0, "inicio", jpg=self._encode(bgr)))
+            # Dirección de avance inicial: hacia donde mira la cámara, en horizontal.
+            fwd = T0[:3, 2] - (T0[:3, 2] @ UP_WORLD) * UP_WORLD
+            self.dir_w = fwd / (np.linalg.norm(fwd) + 1e-12)
             return
         kf, K = self.kf, self.K
         gap = idx - kf.idx
@@ -384,6 +398,7 @@ class LightGlueVO:
         idx0, idx1 = m[inl, 0], m[inl, 1]
         depth_new = np.full(len(kpts), np.nan)
         new_pts = 0
+        ds = self._avance(kf.t_rel, t_rel)  # metros andados según el podómetro
         if parallax < a.min_parallax:
             status, s = "rotacion", kf.scale
             T_j_kf = np.eye(4)
@@ -399,7 +414,9 @@ class LightGlueVO:
             ref = kf.depth_ref[idx0]
             common = valid & ~np.isnan(ref)
             s = kf.scale
-            if common.sum() >= 12:
+            if ds > 0:
+                s = ds  # andando: la línea base la da el podómetro, en metros
+            elif common.sum() >= 12:
                 ratio = np.median(ref[common] / X[common, 2])
                 s = float(np.clip(ratio, kf.scale / 4, kf.scale * 4))
             status = "ok"
@@ -416,9 +433,25 @@ class LightGlueVO:
             new_pts = len(Xw)
 
         T_wc = kf.T_wc @ np.linalg.inv(T_j_kf)
+        if status == "ok":
+            mov = T_wc[:3, 3] - kf.T_wc[:3, 3]
+            if ds > 0 and not a.sin_andar_horizontal:
+                # Andando con el dron en la mano la altura apenas cambia: la VO solo
+                # aporta el rumbo en planta (su componente vertical es la más ruidosa).
+                mov_h = mov - (mov @ UP_WORLD) * UP_WORLD
+                if np.linalg.norm(mov_h) > 1e-9:
+                    mov = mov_h / np.linalg.norm(mov_h) * ds
+                    T_wc[:3, 3] = kf.T_wc[:3, 3] + mov
+            if np.linalg.norm(mov) > 0:
+                self.dir_w = mov / np.linalg.norm(mov)
+        elif ds > 0:
+            # Rotación pura para la VO pero andando: avanzamos lo que diga el podómetro.
+            T_wc[:3, 3] += ds * self.dir_w
         if self.imu_att is not None and a.imu_alpha > 0:
             # Filtro complementario: la VO manda a corto plazo, la IMU evita la deriva.
-            T_wc[:3, :3] = blend_rotation(T_wc[:3, :3], self.imu_att(t_rel), a.imu_alpha)
+            T_wc[:3, :3] = blend_rotation(
+                T_wc[:3, :3], self.imu_att(t_rel), a.imu_alpha
+            )
         self.steps.append(
             Step(
                 idx,
@@ -436,10 +469,16 @@ class LightGlueVO:
                 uv1,
                 inl,
                 rot_imu=rot_imu,
+                avance_pod=ds,
             )
         )
         self._new_keyframe(idx, t_rel, feats, kpts, bgr, T_wc, s, depth_new)
         self._densificar()
+
+    def _avance(self, t0, t1):
+        if self.podometro is None:
+            return 0.0
+        return self.podometro.distancia(t1) - self.podometro.distancia(t0)
 
     def _densificar(self):
         """Nube densa del keyframe actual si han pasado --denso-cada keyframes desde la última."""
@@ -484,6 +523,9 @@ class LightGlueVO:
         if self.imu_att is not None:
             T_wc[:3, :3] = self.imu_att(t_rel)
             status = "perdido_imu"
+        ds = self._avance(self.kf.t_rel, t_rel)
+        if ds > 0:
+            T_wc[:3, 3] += ds * self.dir_w  # seguimos andando aunque la imagen no sirva
         self.steps.append(
             Step(
                 idx,
@@ -496,6 +538,7 @@ class LightGlueVO:
                 0.0,
                 self.kf.scale,
                 jpg=self._encode(bgr),
+                avance_pod=ds,
             )
         )
         self._new_keyframe(idx, t_rel, feats, kpts, bgr, T_wc, self.kf.scale)
@@ -508,7 +551,9 @@ class LightGlueVO:
     def sparse_cloud_with_owner(self):
         """Nube dispersa y, por punto, el índice del paso que lo creó."""
         P, C = self.cloud()
-        owners = [np.full(s.new_points, i) for i, s in enumerate(self.steps) if s.new_points]
+        owners = [
+            np.full(s.new_points, i) for i, s in enumerate(self.steps) if s.new_points
+        ]
         owner = np.concatenate(owners) if owners else np.zeros(0, int)
         return P, C, owner
 
@@ -561,6 +606,7 @@ def save_tables(out: Path, steps, P, C, dense=None):
                 "escala",
                 "puntos_nuevos",
                 "rot_imu",
+                "avance_podometro_m",
             ]
         )
         for s in steps:
@@ -579,6 +625,7 @@ def save_tables(out: Path, steps, P, C, dense=None):
                     f"{s.scale:.4f}",
                     s.new_points,
                     int(s.rot_imu),
+                    f"{s.avance_pod:.3f}",
                 ]
             )
     write_ply(out / "puntos_3d.ply", P, C)
@@ -591,8 +638,14 @@ def write_ply(path: Path, P, C):
     Pp = (CAM_TO_PLOT @ P.T).T
     v = np.empty(
         len(Pp),
-        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-               ("red", "u1"), ("green", "u1"), ("blue", "u1")],
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("red", "u1"),
+            ("green", "u1"),
+            ("blue", "u1"),
+        ],
     )
     v["x"], v["y"], v["z"] = Pp.T
     v["red"], v["green"], v["blue"] = C.T
@@ -663,7 +716,9 @@ def plane_summary(mapa, dense, min_hull_points=200):
             c -= (n @ c - pl.d) * n
             uv = np.column_stack([(Pg - c) @ e1, (Pg - c) @ e2]).astype(np.float32)
             h = cv2.convexHull(uv)[:, 0, :]
-            hull = (CAM_TO_PLOT @ (c + np.outer(h[:, 0], e1) + np.outer(h[:, 1], e2)).T).T
+            hull = (
+                CAM_TO_PLOT @ (c + np.outer(h[:, 0], e1) + np.outer(h[:, 1], e2)).T
+            ).T
         out.append(
             {
                 "id": g,
@@ -682,14 +737,19 @@ def plane_summary(mapa, dense, min_hull_points=200):
 def save_planes(out: Path, planes, dense):
     """planos.json y puntos_planos.ply (nube densa coloreada por tipo de plano)."""
     serial = [
-        {k: (v.round(5).tolist() if isinstance(v, np.ndarray) else v) for k, v in pl.items()}
+        {
+            k: (v.round(5).tolist() if isinstance(v, np.ndarray) else v)
+            for k, v in pl.items()
+        }
         for pl in planes
     ]
     (out / "planos.json").write_text(
         json.dumps(serial, indent=1, ensure_ascii=False), encoding="utf-8"
     )
     P, ids = dense[0], dense[3]
-    rgb = {k: [int(c[i : i + 2], 16) for i in (1, 3, 5)] for k, c in PLANE_COLORS.items()}
+    rgb = {
+        k: [int(c[i : i + 2], 16) for i in (1, 3, 5)] for k, c in PLANE_COLORS.items()
+    }
     C = np.full((len(P), 3), 60, np.uint8)  # puntos sin plano en gris oscuro
     for pl in planes:
         C[ids == pl["id"]] = rgb[pl["tipo"]]
@@ -716,17 +776,36 @@ def plane_meshes(planes):
         if ii:
             traces.append(
                 go.Mesh3d(
-                    x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
-                    color=color, opacity=0.35, name=f"Planos: {tipo}",
-                    showlegend=True, hoverinfo="name", flatshading=True,
+                    x=xs,
+                    y=ys,
+                    z=zs,
+                    i=ii,
+                    j=jj,
+                    k=kk,
+                    color=color,
+                    opacity=0.35,
+                    name=f"Planos: {tipo}",
+                    showlegend=True,
+                    hoverinfo="name",
+                    flatshading=True,
                 )
             )
     return traces
 
 
 def plotly_report(
-    out: Path, steps, P, C, estado, t0_host, name, dense=None, planes=None,
-    max_points=40000, max_dense=150000,
+    out: Path,
+    steps,
+    P,
+    C,
+    estado,
+    t0_host,
+    name,
+    dense=None,
+    planes=None,
+    metric=False,
+    max_points=40000,
+    max_dense=150000,
 ):
     pos = np.array([CAM_TO_PLOT @ s.T_wc[:3, 3] for s in steps])
     ang = np.array([orientation_deg(s.T_wc[:3, :3]) for s in steps])
@@ -746,7 +825,8 @@ def plotly_report(
         vertical_spacing=0.06,
         horizontal_spacing=0.08,
         subplot_titles=(
-            "Trayectoria y nube de puntos (escala arbitraria)",
+            "Trayectoria y nube de puntos "
+            + ("(metros, escala del podómetro)" if metric else "(escala arbitraria)"),
             "Posición del dron",
             "Yaw: VO vs IMU del Tello",
             "Pitch y roll (VO)",
@@ -980,7 +1060,7 @@ def plotly_report(
         gridcolor=GRID, zeroline=False, linecolor=GRID, tickfont=dict(color=TEXT2)
     )
     for r, c, ylab in (
-        (2, 1, "unidades VO"),
+        (2, 1, "m" if metric else "unidades VO"),
         (2, 2, "Δ yaw [°]"),
         (3, 1, "grados"),
         (3, 2, "nº puntos"),
@@ -1144,7 +1224,12 @@ def put(img, text, org, scale=0.55, color=(235, 235, 235), thick=1):
 
 
 def render_animation(
-    out: Path, vo: LightGlueVO, cloud, fps_out, gif_frames, gif_width,
+    out: Path,
+    vo: LightGlueVO,
+    cloud,
+    fps_out,
+    gif_frames,
+    gif_width,
     max_points=600000,
 ):
     """`cloud` = (P, C, owner): puntos en orden de creación y el paso que creó cada uno."""
@@ -1313,6 +1398,23 @@ def main():
         help="[°] discrepancia VO-IMU por paso a partir de la cual manda la IMU",
     )
     p.add_argument(
+        "--zancada",
+        type=float,
+        default=0.65,
+        help="Metros por paso del podómetro (calíbralo andando una distancia conocida)",
+    )
+    p.add_argument(
+        "--sin-andar-horizontal",
+        action="store_true",
+        help="Permitir cambios de altura al andar (p. ej. escaleras); por defecto,"
+        " mientras se anda la traslación se restringe al plano horizontal",
+    )
+    p.add_argument(
+        "--sin-podometro",
+        action="store_true",
+        help="No usar el podómetro de la IMU para la escala (escala arbitraria)",
+    )
+    p.add_argument(
         "--imu-alpha",
         type=float,
         default=0.05,
@@ -1356,8 +1458,15 @@ def main():
     imu_att = None
     if estado is not None and stamps is not None and not args.sin_imu:
         imu_att = imu_attitude_fn(estado, t0_host)
+    podometro = None
+    if imu_att is not None and not args.sin_podometro and "agz" in estado:
+        podometro = crear_podometro(estado, t0_host, args.zancada)
+        print(
+            f"Podómetro: {len(podometro.t_pasos)} pasos -> {podometro.total:.1f} m "
+            f"(zancada {args.zancada} m)"
+        )
     densificador = Densificador(device, args.denso_paso) if args.denso else None
-    vo = LightGlueVO(args, device, imu_att, densificador)
+    vo = LightGlueVO(args, device, imu_att, densificador, podometro)
     tic = time.time()
     n = 0
     for idx, fps, frame in iter_video(video, args.start, args.end, args.step):
@@ -1383,7 +1492,15 @@ def main():
     )
     print("Estados:", {k: estados.count(k) for k in sorted(set(estados))})
     if imu_att is not None:
-        print(f"Saltos de rotación corregidos con la IMU: {sum(s.rot_imu for s in vo.steps)}")
+        print(
+            f"Saltos de rotación corregidos con la IMU: {sum(s.rot_imu for s in vo.steps)}"
+        )
+    pos = np.array([s.T_wc[:3, 3] for s in vo.steps])
+    recorrido = float(np.sum(np.linalg.norm(np.diff(pos, axis=0), axis=1)))
+    print(
+        f"Recorrido de la trayectoria: {recorrido:.1f} "
+        + ("m" if podometro is not None else "unidades VO")
+    )
     if dense is not None:
         n_kf_dense = sum(1 for s in vo.steps if s.dense_points)
         n_raw = sum(len(d) for d in vo.dense_P)
@@ -1404,12 +1521,12 @@ def main():
         )
 
     save_tables(out, vo.steps, P, C, dense)
-    plotly_report(out, vo.steps, P, C, estado, t0_host, name, dense, planes)
+    plotly_report(
+        out, vo.steps, P, C, estado, t0_host, name, dense, planes, podometro is not None
+    )
     print("Renderizando animación paso a paso...")
     cloud = dense[:3] if dense is not None else vo.sparse_cloud_with_owner()
-    render_animation(
-        out, vo, cloud, args.fps_anim, args.gif_frames, args.gif_width
-    )
+    render_animation(out, vo, cloud, args.fps_anim, args.gif_frames, args.gif_width)
     info = {
         "sesion": name,
         "video": str(video),
@@ -1425,7 +1542,17 @@ def main():
         "parametros": {
             k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
         },
-        "aviso": "Escala métrica no observable (monocular); orientación afectada por posible EIS.",
+        "podometro": (
+            {"pasos": len(podometro.t_pasos), "zancada_m": args.zancada,
+             "distancia_m": round(podometro.total, 2)}
+            if podometro is not None else None
+        ),
+        "recorrido": round(recorrido, 3),
+        "aviso": (
+            "Escala en metros vía podómetro: depende de --zancada (error típico 10-20 %)."
+            if podometro is not None
+            else "Escala métrica no observable (monocular); orientación afectada por posible EIS."
+        ),
     }
     (out / "informe.json").write_text(
         json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8"
