@@ -3,10 +3,12 @@
 Dependencias (venv propio de tello/):
     uv venv .venv --python 3.11
     uv pip install torch --index-url https://download.pytorch.org/whl/cu126
-    uv pip install "git+https://github.com/cvg/LightGlue.git" opencv-python numpy plotly pillow
+    uv pip install "git+https://github.com/cvg/LightGlue.git" opencv-python numpy plotly pillow av
+    uv pip install transformers   # solo para --denso / --planos
 
 Ejemplo:
     .venv/Scripts/python.exe VO_lightglue.py sesiones/20261017_113325
+    .venv/Scripts/python.exe VO_lightglue.py sesiones/20261017_113325 --planos
     .venv/Scripts/python.exe VO_lightglue.py sesiones/20261017_113325 --start 300 --end 900
 
 Flujo por pares de keyframes:
@@ -14,13 +16,23 @@ Flujo por pares de keyframes:
   2. Un fotograma se convierte en keyframe cuando el flujo mediano supera
      --min-flow píxeles (o tras --max-gap fotogramas).
   3. Matriz esencial (USAC MAGSAC) + recoverPose -> R, t con |t| = 1.
-  4. Triangulación de los inliers. La escala relativa entre pasos se obtiene
+  4. Fusión con la actitud del Tello (estado.csv, salvo --sin-imu): si la
+     rotación de la VO discrepa más de --imu-max-err grados de la de la IMU se
+     usa la de la IMU y t se recalcula con R fija; además, en cada keyframe la
+     orientación se acerca un --imu-alpha a la de la IMU (filtro complementario).
+     El mundo queda nivelado con la gravedad (z hacia arriba en las gráficas).
+  5. Triangulación de los inliers. La escala relativa entre pasos se obtiene
      comparando la profundidad de los puntos compartidos con el paso anterior,
      de modo que la trayectoria es coherente (aunque sigue sin escala métrica).
-  5. Si el paralaje es casi nulo se trata como rotación pura (t = 0).
+  6. Si el paralaje es casi nulo se trata como rotación pura (t = 0).
+  7. Con --denso, 1 de cada --denso-cada keyframes se densifica con Depth
+     Anything V2 escalado a la VO (ver densificar.py) y se fusiona por vóxeles.
+  8. Con --planos, además se detectan planos, se asocian entre tomas y los
+     puntos se proyectan sobre su plano definitivo (ver planos.py).
 
 Salidas en resultados_vo_lightglue/<sesion>/:
-    poses.csv, puntos_3d.ply, informe.json,
+    poses.csv, puntos_3d.ply, puntos_densos.ply (con --denso), informe.json,
+    planos.json y puntos_planos.ply (con --planos),
     trayectoria.html (Plotly), reconstruccion.mp4 y reconstruccion.gif (paso a paso).
 """
 
@@ -43,6 +55,9 @@ from lightglue import LightGlue, SuperPoint
 from lightglue.utils import numpy_image_to_torch
 from PIL import Image
 from plotly.subplots import make_subplots
+
+from densificar import Densificador, fusionar_voxeles
+from planos import MapaPlanos, detectar_planos
 
 HERE = Path(__file__).resolve().parent
 
@@ -156,11 +171,77 @@ def orientation_deg(R_wc):
 # --------------------------------------------------------------------------
 
 
-def yaw_rotation_cam(dyaw_deg):
-    """Giro de yaw (horario visto desde arriba) expresado en el marco cámara-0."""
-    a = np.radians(-dyaw_deg)
-    Rz = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1.0]])
-    return CAM_TO_PLOT.T @ Rz @ CAM_TO_PLOT
+def _rx(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def _ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def _rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+# Cuerpo del Tello (x adelante, y derecha, z abajo) <- cámara (x derecha, y abajo, z adelante).
+R_BODY_CAM = np.array([[0, 0, 1.0], [1.0, 0, 0], [0, 1.0, 0]])
+
+
+def imu_attitude_fn(estado, t0_host):
+    """t_rel -> R_wc de la cámara según la actitud del Tello.
+
+    Convención comprobada con los datos (2026-10-22): NED, R = Rz(yaw)·Ry(pitch)·Rx(roll),
+    todos con signo positivo, desfase con el vídeo despreciable. El marco de mundo
+    devuelto es el de la cámara (x derecha, y abajo, z adelante) pero nivelado con la
+    gravedad y con el yaw inicial a cero, así que CAM_TO_PLOT lo deja con z hacia arriba.
+    """
+    te = estado["t_host"] - t0_host
+    ang = {k: np.unwrap(np.radians(estado[k])) for k in ("yaw", "pitch", "roll")}
+    yaw0 = float(np.interp(0.0, te, ang["yaw"]))
+    level = R_BODY_CAM.T @ _rz(-yaw0)
+
+    def att(t):
+        y, p, r = (float(np.interp(t, te, ang[k])) for k in ("yaw", "pitch", "roll"))
+        return level @ _rz(y) @ _ry(p) @ _rx(r) @ R_BODY_CAM
+
+    return att
+
+
+def rot_angle_deg(R):
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+
+def blend_rotation(R, R_target, alpha):
+    """Gira R una fracción alpha del camino hacia R_target (slerp en SO(3))."""
+    rv, _ = cv2.Rodrigues(R_target @ R.T)
+    dR, _ = cv2.Rodrigues(alpha * rv)
+    return dR @ R
+
+
+def translation_known_rotation(K, R, uv0, uv1, iters=3):
+    """Dirección de t (|t| = 1) con R conocida: t · (R·x0 × x1) = 0 para cada pareja.
+
+    Mínimos cuadrados con rechazo iterativo de outliers; el signo se fija por
+    quiralidad (más puntos triangulados delante de ambas cámaras).
+    """
+    x0 = np.linalg.inv(K) @ np.column_stack([uv0, np.ones(len(uv0))]).T
+    x1 = np.linalg.inv(K) @ np.column_stack([uv1, np.ones(len(uv1))]).T
+    A = np.cross((R @ x0).T, x1.T)
+    keep = np.ones(len(A), bool)
+    t = None
+    for _ in range(iters):
+        if keep.sum() < 8:
+            break
+        t = np.linalg.svd(A[keep])[2][-1]
+        res = np.abs(A @ t)
+        keep = res < max(3 * np.median(res[keep]), 1e-4)
+    if t is None:
+        return None
+    best = max((t, -t), key=lambda tt: triangulate(K, R, tt, uv0, uv1)[1].sum())
+    return best
 
 
 @dataclass
@@ -193,13 +274,23 @@ class Step:
     uv_prev: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
     uv_cur: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
     inlier_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
+    dense_points: int = 0
+    rot_imu: bool = False  # la rotación de este paso se tomó de la IMU (salto de la VO)
 
 
 class LightGlueVO:
-    def __init__(self, args, device, imu_yaw=None):
+    def __init__(self, args, device, imu_att=None, densificador=None):
         self.args = args
         self.device = device
-        self.imu_yaw = imu_yaw  # t_rel -> yaw IMU desenrollado [°], o None
+        self.imu_att = imu_att  # t_rel -> R_wc según la IMU (mundo nivelado), o None
+        self.densificador = densificador
+        self.dense_P: list[np.ndarray] = []
+        self.dense_C: list[np.ndarray] = []
+        self.dense_owner: list[np.ndarray] = []
+        self.dense_z: list[float] = []  # profundidad mediana de cada keyframe densificado
+        self.dense_plane: list[np.ndarray] = []  # id de plano global por punto (-1 = ninguno)
+        self.mapa_planos = MapaPlanos() if getattr(args, "planos", False) else None
+        self._kf_sin_denso = 0
         self.extractor = SuperPoint(max_num_keypoints=args.max_kpts).eval().to(device)
         self.matcher = LightGlue(features="superpoint").eval().to(device)
         self.K = None
@@ -237,10 +328,11 @@ class LightGlueVO:
             self.K = make_K(w, h, a.fx, a.fy, a.cx, a.cy)
         feats, kpts = self.extract(bgr)
         if self.kf is None:
-            self._new_keyframe(idx, t_rel, feats, kpts, bgr, np.eye(4), 1.0)
-            self.steps.append(
-                Step(idx, t_rel, np.eye(4), "inicio", jpg=self._encode(bgr))
-            )
+            T0 = np.eye(4)
+            if self.imu_att is not None:
+                T0[:3, :3] = self.imu_att(t_rel)  # mundo nivelado con la gravedad
+            self._new_keyframe(idx, t_rel, feats, kpts, bgr, T0, 1.0)
+            self.steps.append(Step(idx, t_rel, T0, "inicio", jpg=self._encode(bgr)))
             return
         kf, K = self.kf, self.K
         gap = idx - kf.idx
@@ -271,6 +363,16 @@ class LightGlueVO:
                 self._lost(idx, t_rel, feats, kpts, bgr, len(m), flow)
             return
         t = t.ravel()
+
+        # Salto de rotación: si la VO y la IMU discrepan, manda la IMU y t se
+        # recalcula con esa rotación fija.
+        rot_imu = False
+        if self.imu_att is not None:
+            R_imu = self.imu_att(t_rel).T @ self.imu_att(kf.t_rel)
+            if rot_angle_deg(R @ R_imu.T) > a.imu_max_err:
+                t_imu = translation_known_rotation(K, R_imu, uv0[inl], uv1[inl])
+                if t_imu is not None:
+                    R, t, rot_imu = R_imu, t_imu, True
 
         # Paralaje tras compensar la rotación: separa traslación de rotación pura.
         r0, r1 = rays(K, uv0[inl]), rays(K, uv1[inl])
@@ -314,6 +416,9 @@ class LightGlueVO:
             new_pts = len(Xw)
 
         T_wc = kf.T_wc @ np.linalg.inv(T_j_kf)
+        if self.imu_att is not None and a.imu_alpha > 0:
+            # Filtro complementario: la VO manda a corto plazo, la IMU evita la deriva.
+            T_wc[:3, :3] = blend_rotation(T_wc[:3, :3], self.imu_att(t_rel), a.imu_alpha)
         self.steps.append(
             Step(
                 idx,
@@ -330,21 +435,54 @@ class LightGlueVO:
                 uv0,
                 uv1,
                 inl,
+                rot_imu=rot_imu,
             )
         )
         self._new_keyframe(idx, t_rel, feats, kpts, bgr, T_wc, s, depth_new)
+        self._densificar()
+
+    def _densificar(self):
+        """Nube densa del keyframe actual si han pasado --denso-cada keyframes desde la última."""
+        if self.densificador is None:
+            return
+        self._kf_sin_denso += 1
+        if self._kf_sin_denso < self.args.denso_cada:
+            return
+        kf = self.kf
+        ok = ~np.isnan(kf.depth_ref)
+        X, Cg, _ = self.densificador.rejilla(
+            kf.image, self.K, kf.kpts[ok], kf.depth_ref[ok]
+        )
+        if X is None:
+            return  # ajuste poco fiable: se reintenta con el siguiente keyframe
+        valid = ~np.isnan(X).any(-1)
+        R_wc, t_wc = kf.T_wc[:3, :3], kf.T_wc[:3, 3]
+        P = X[valid] @ R_wc.T + t_wc
+        z_med = float(np.median(kf.depth_ref[ok]))
+        ids = np.full(len(P), -1, int)
+        if self.mapa_planos is not None:
+            labels, planos_cam = detectar_planos(X)
+            ids = self.mapa_planos.integrar(
+                P, labels[valid], planos_cam, R_wc, t_wc, z_med, len(self.steps) - 1
+            )
+        self.dense_P.append(P)
+        self.dense_C.append(Cg[valid])
+        self.dense_owner.append(np.full(len(P), len(self.steps) - 1))
+        self.dense_plane.append(ids)
+        self.dense_z.append(z_med)
+        self.steps[-1].dense_points = len(P)
+        self._kf_sin_denso = 0
 
     def _lost(self, idx, t_rel, feats, kpts, bgr, n_matches, flow):
         """Sin geometría fiable: se reinicia en este fotograma conservando la posición.
 
-        La orientación salta con el yaw de la IMU del Tello si está disponible
+        La orientación se toma de la IMU del Tello si está disponible
         (las pérdidas suelen ser giros rápidos con motion blur).
         """
         T_wc = self.kf.T_wc.copy()
         status = "perdido"
-        if self.imu_yaw is not None:
-            dyaw = self.imu_yaw(t_rel) - self.imu_yaw(self.kf.t_rel)
-            T_wc[:3, :3] = yaw_rotation_cam(dyaw) @ T_wc[:3, :3]
+        if self.imu_att is not None:
+            T_wc[:3, :3] = self.imu_att(t_rel)
             status = "perdido_imu"
         self.steps.append(
             Step(
@@ -367,13 +505,42 @@ class LightGlueVO:
             return np.zeros((0, 3)), np.zeros((0, 3), np.uint8)
         return np.vstack(self.points), np.vstack(self.colors)
 
+    def sparse_cloud_with_owner(self):
+        """Nube dispersa y, por punto, el índice del paso que lo creó."""
+        P, C = self.cloud()
+        owners = [np.full(s.new_points, i) for i, s in enumerate(self.steps) if s.new_points]
+        owner = np.concatenate(owners) if owners else np.zeros(0, int)
+        return P, C, owner
+
+    def dense_cloud(self, voxel=None):
+        """Nube densa fusionada por vóxeles (P, C, owner, plane_id), o None si no hay.
+
+        Con --planos, cada punto se proyecta antes sobre su plano global definitivo.
+        """
+        if not self.dense_P:
+            return None
+        if voxel is None:
+            # Separación entre muestras a la profundidad típica: z · paso / fx.
+            voxel = np.median(self.dense_z) * self.densificador.paso / self.K[0, 0]
+        P = np.vstack(self.dense_P)
+        ids = np.concatenate(self.dense_plane)
+        if self.mapa_planos is not None:
+            P = self.mapa_planos.proyectar(P, ids)
+        return fusionar_voxeles(
+            P,
+            voxel,
+            np.vstack(self.dense_C),
+            np.concatenate(self.dense_owner),
+            ids,
+        )
+
 
 # --------------------------------------------------------------------------
 # Salidas en disco
 # --------------------------------------------------------------------------
 
 
-def save_tables(out: Path, steps, P, C):
+def save_tables(out: Path, steps, P, C, dense=None):
     with (out / "poses.csv").open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
@@ -393,6 +560,7 @@ def save_tables(out: Path, steps, P, C):
                 "paralaje_deg",
                 "escala",
                 "puntos_nuevos",
+                "rot_imu",
             ]
         )
         for s in steps:
@@ -410,17 +578,34 @@ def save_tables(out: Path, steps, P, C):
                     f"{s.parallax_deg:.2f}",
                     f"{s.scale:.4f}",
                     s.new_points,
+                    int(s.rot_imu),
                 ]
             )
+    write_ply(out / "puntos_3d.ply", P, C)
+    if dense is not None:
+        write_ply(out / "puntos_densos.ply", dense[0], dense[1])
+
+
+def write_ply(path: Path, P, C):
+    """PLY binario (x, y, z en el marco de visualización + color RGB)."""
     Pp = (CAM_TO_PLOT @ P.T).T
-    with (out / "puntos_3d.ply").open("w", encoding="ascii") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(Pp)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        f.write("end_header\n")
-        for p, c in zip(Pp, C):
-            f.write(f"{p[0]:.5f} {p[1]:.5f} {p[2]:.5f} {c[0]} {c[1]} {c[2]}\n")
+    v = np.empty(
+        len(Pp),
+        dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+               ("red", "u1"), ("green", "u1"), ("blue", "u1")],
+    )
+    v["x"], v["y"], v["z"] = Pp.T
+    v["red"], v["green"], v["blue"] = C.T
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {len(v)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    )
+    with path.open("wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(v.tobytes())
 
 
 def near_trajectory(P, steps, factor=1.0):
@@ -450,9 +635,99 @@ def frustum_lines(T_wc, size, aspect=0.75):
 BLUE, ORANGE, AQUA, RED = "#2a78d6", "#eb6834", "#1baf7a", "#e34948"
 TEXT2, GRID, SURFACE = "#52514e", "#e6e5e0", "#fcfcfb"
 TIME_SCALE = [[0.0, "#9ec5f4"], [0.5, "#2a78d6"], [1.0, "#0d366b"]]
+# Tres clases con color (los tres primeros huecos de la paleta) y el resto en gris.
+PLANE_COLORS = {
+    "horizontal": BLUE,
+    "pared A": ORANGE,
+    "pared B": AQUA,
+    "otro": "#8a8984",
+}
 
 
-def plotly_report(out: Path, steps, P, C, estado, t0_host, name, max_points=40000):
+def plane_summary(mapa, dense, min_hull_points=200):
+    """Tipo, normal, puntos y contorno (casco convexo en el plano) de cada plano del mapa."""
+    P, ids = dense[0], dense[3]
+    up_world = CAM_TO_PLOT.T @ np.array([0, 0, 1.0])
+    tipos = mapa.clasificar(up_world)
+    out = []
+    for g, (pl, tipo) in enumerate(zip(mapa.planos, tipos)):
+        Pg = P[ids == g]
+        hull = None
+        if len(Pg) >= min_hull_points:
+            n = pl.n
+            a = np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else np.array([0, 1.0, 0])
+            e1 = np.cross(n, a)
+            e1 /= np.linalg.norm(e1)
+            e2 = np.cross(n, e1)
+            c = Pg.mean(axis=0)
+            c -= (n @ c - pl.d) * n
+            uv = np.column_stack([(Pg - c) @ e1, (Pg - c) @ e2]).astype(np.float32)
+            h = cv2.convexHull(uv)[:, 0, :]
+            hull = (CAM_TO_PLOT @ (c + np.outer(h[:, 0], e1) + np.outer(h[:, 1], e2)).T).T
+        out.append(
+            {
+                "id": g,
+                "tipo": tipo,
+                "normal": (CAM_TO_PLOT @ pl.n).round(4).tolist(),
+                "d": round(pl.d, 5),
+                "puntos": int(len(Pg)),
+                "tomas": pl.tomas,
+                "primer_paso": pl.primer_paso,
+                "contorno": hull,
+            }
+        )
+    return out
+
+
+def save_planes(out: Path, planes, dense):
+    """planos.json y puntos_planos.ply (nube densa coloreada por tipo de plano)."""
+    serial = [
+        {k: (v.round(5).tolist() if isinstance(v, np.ndarray) else v) for k, v in pl.items()}
+        for pl in planes
+    ]
+    (out / "planos.json").write_text(
+        json.dumps(serial, indent=1, ensure_ascii=False), encoding="utf-8"
+    )
+    P, ids = dense[0], dense[3]
+    rgb = {k: [int(c[i : i + 2], 16) for i in (1, 3, 5)] for k, c in PLANE_COLORS.items()}
+    C = np.full((len(P), 3), 60, np.uint8)  # puntos sin plano en gris oscuro
+    for pl in planes:
+        C[ids == pl["id"]] = rgb[pl["tipo"]]
+    write_ply(out / "puntos_planos.ply", P, C)
+
+
+def plane_meshes(planes):
+    """Un Mesh3d por tipo de plano, con cada contorno triangulado en abanico."""
+    traces = []
+    for tipo, color in PLANE_COLORS.items():
+        xs, ys, zs, ii, jj, kk = [], [], [], [], [], []
+        for pl in planes:
+            h = pl["contorno"]
+            if pl["tipo"] != tipo or h is None or len(h) < 3:
+                continue
+            base = len(xs)
+            xs += h[:, 0].tolist()
+            ys += h[:, 1].tolist()
+            zs += h[:, 2].tolist()
+            for q in range(1, len(h) - 1):
+                ii.append(base)
+                jj.append(base + q)
+                kk.append(base + q + 1)
+        if ii:
+            traces.append(
+                go.Mesh3d(
+                    x=xs, y=ys, z=zs, i=ii, j=jj, k=kk,
+                    color=color, opacity=0.35, name=f"Planos: {tipo}",
+                    showlegend=True, hoverinfo="name", flatshading=True,
+                )
+            )
+    return traces
+
+
+def plotly_report(
+    out: Path, steps, P, C, estado, t0_host, name, dense=None, planes=None,
+    max_points=40000, max_dense=150000,
+):
     pos = np.array([CAM_TO_PLOT @ s.T_wc[:3, 3] for s in steps])
     ang = np.array([orientation_deg(s.T_wc[:3, :3]) for s in steps])
     t = np.array([s.t_rel for s in steps])
@@ -482,6 +757,29 @@ def plotly_report(out: Path, steps, P, C, estado, t0_host, name, max_points=4000
     if len(P):
         keep = near_trajectory(P, steps)
         P, C = P[keep], C[keep]
+    if dense is not None and len(dense[0]):
+        Pd, Cd = dense[0], dense[1]
+        keep = near_trajectory(Pd, steps)
+        Pd, Cd = Pd[keep], Cd[keep]
+        sel = np.linspace(0, len(Pd) - 1, min(max_dense, len(Pd))).astype(int)
+        Pp = (CAM_TO_PLOT @ Pd[sel].T).T
+        fig.add_trace(
+            go.Scatter3d(
+                x=Pp[:, 0],
+                y=Pp[:, 1],
+                z=Pp[:, 2],
+                mode="markers",
+                name="Nube densa (Depth Anything)",
+                marker=dict(
+                    size=1.4,
+                    color=[f"rgb({r},{g},{b})" for r, g, b in Cd[sel]],
+                    opacity=0.8,
+                ),
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=1,
+        )
     if len(P):
         sel = np.linspace(0, len(P) - 1, min(max_points, len(P))).astype(int)
         Pp = (CAM_TO_PLOT @ P[sel].T).T
@@ -491,17 +789,23 @@ def plotly_report(out: Path, steps, P, C, estado, t0_host, name, max_points=4000
                 y=Pp[:, 1],
                 z=Pp[:, 2],
                 mode="markers",
-                name="Puntos 3D",
+                name="Puntos 3D (LightGlue)",
                 marker=dict(
                     size=1.6,
                     color=[f"rgb({r},{g},{b})" for r, g, b in C[sel]],
                     opacity=0.7,
                 ),
                 hoverinfo="skip",
+                # Con nube densa, la dispersa queda oculta (se activa en la leyenda).
+                visible="legendonly" if dense is not None else True,
             ),
             row=1,
             col=1,
         )
+
+    if planes:
+        for tr in plane_meshes(planes):
+            fig.add_trace(tr, row=1, col=1)
 
     xs, ys, zs = [], [], []
     every = max(1, len(steps) // 120)
@@ -839,7 +1143,11 @@ def put(img, text, org, scale=0.55, color=(235, 235, 235), thick=1):
     )
 
 
-def render_animation(out: Path, vo: LightGlueVO, fps_out, gif_frames, gif_width):
+def render_animation(
+    out: Path, vo: LightGlueVO, cloud, fps_out, gif_frames, gif_width,
+    max_points=600000,
+):
+    """`cloud` = (P, C, owner): puntos en orden de creación y el paso que creó cada uno."""
     steps = vo.steps
     pw, ph, header = 640, 480, 44
     W, H = 2 * pw, ph + header
@@ -852,15 +1160,13 @@ def render_animation(out: Path, vo: LightGlueVO, fps_out, gif_frames, gif_width)
         else 0.05
     )
 
-    # Puntos acumulados en orden de creación, con su keyframe de origen.
-    owners = []
-    for i, s in enumerate(steps):
-        if s.new_points:
-            owners.append(np.full(s.new_points, i))
-    owner = np.concatenate(owners) if owners else np.zeros(0, int)
-    P, C = vo.cloud()
+    P, C, owner = cloud
     if len(P):
         keep = near_trajectory(P, steps)
+        if keep.sum() > max_points:  # submuestreo uniforme conservando el orden
+            idx = np.flatnonzero(keep)
+            keep[:] = False
+            keep[idx[np.linspace(0, len(idx) - 1, max_points).astype(int)]] = True
         P, C, owner = P[keep], C[keep], owner[keep]
     Pp = (CAM_TO_PLOT @ P.T).T if len(P) else P
     Cbgr = (
@@ -998,9 +1304,45 @@ def main():
     p.add_argument(
         "--sin-imu",
         action="store_true",
-        help="No usar el yaw de estado.csv para cubrir las pérdidas de tracking",
+        help="No fusionar la actitud de estado.csv (solo VO)",
+    )
+    p.add_argument(
+        "--imu-max-err",
+        type=float,
+        default=4.0,
+        help="[°] discrepancia VO-IMU por paso a partir de la cual manda la IMU",
+    )
+    p.add_argument(
+        "--imu-alpha",
+        type=float,
+        default=0.05,
+        help="Fracción por keyframe con la que la orientación se acerca a la IMU",
+    )
+    p.add_argument(
+        "--denso",
+        action="store_true",
+        help="Densificar keyframes con Depth Anything V2 alineado a la escala de la VO",
+    )
+    p.add_argument(
+        "--denso-cada", type=int, default=4, help="Densificar 1 de cada N keyframes"
+    )
+    p.add_argument(
+        "--denso-paso", type=int, default=8, help="Muestrear 1 píxel cada X en u y v"
+    )
+    p.add_argument(
+        "--planos",
+        action="store_true",
+        help="Detectar planos, asociarlos entre tomas y ajustar a ellos la nube densa"
+        " (implica --denso)",
+    )
+    p.add_argument(
+        "--voxel",
+        type=float,
+        default=None,
+        help="Tamaño de vóxel de la fusión (por defecto: separación entre muestras)",
     )
     args = p.parse_args()
+    args.denso = args.denso or args.planos
 
     video, stamps, estado, name = resolve_inputs(args.entrada)
     out = args.out or HERE / "resultados_vo_lightglue" / name
@@ -1011,12 +1353,11 @@ def main():
     print(f"Dispositivo: {device}  vídeo: {video}")
 
     t0_host = stamps[0] if stamps is not None else 0.0
-    imu_yaw = None
+    imu_att = None
     if estado is not None and stamps is not None and not args.sin_imu:
-        te = estado["t_host"] - t0_host
-        ye = np.degrees(np.unwrap(np.radians(estado["yaw"])))
-        imu_yaw = lambda t: float(np.interp(t, te, ye))  # noqa: E731
-    vo = LightGlueVO(args, device, imu_yaw)
+        imu_att = imu_attitude_fn(estado, t0_host)
+    densificador = Densificador(device, args.denso_paso) if args.denso else None
+    vo = LightGlueVO(args, device, imu_att, densificador)
     tic = time.time()
     n = 0
     for idx, fps, frame in iter_video(video, args.start, args.end, args.step):
@@ -1034,17 +1375,41 @@ def main():
         raise SystemExit("No se ha podido estimar ninguna pose: revisa el intervalo")
 
     P, C = vo.cloud()
+    dense = vo.dense_cloud(args.voxel)
     estados = [s.status for s in vo.steps]
     print(
         f"Fotogramas procesados: {n}  keyframes: {len(vo.steps)}  puntos 3D: {len(P)}  "
         f"({time.time() - tic:.0f} s)"
     )
     print("Estados:", {k: estados.count(k) for k in sorted(set(estados))})
+    if imu_att is not None:
+        print(f"Saltos de rotación corregidos con la IMU: {sum(s.rot_imu for s in vo.steps)}")
+    if dense is not None:
+        n_kf_dense = sum(1 for s in vo.steps if s.dense_points)
+        n_raw = sum(len(d) for d in vo.dense_P)
+        print(
+            f"Nube densa: {n_kf_dense} keyframes, {n_raw} muestras -> "
+            f"{len(dense[0])} tras fusionar por vóxeles"
+        )
 
-    save_tables(out, vo.steps, P, C)
-    plotly_report(out, vo.steps, P, C, estado, t0_host, name)
+    planes = None
+    if vo.mapa_planos is not None and dense is not None:
+        planes = plane_summary(vo.mapa_planos, dense)
+        save_planes(out, planes, dense)
+        tipos = [pl["tipo"] for pl in planes]
+        print(
+            f"Planos: {len(planes)} en el mapa "
+            f"({sum(pl['tomas'] > 1 for pl in planes)} vistos en varias tomas); "
+            + ", ".join(f"{k}: {tipos.count(k)}" for k in PLANE_COLORS if k in tipos)
+        )
+
+    save_tables(out, vo.steps, P, C, dense)
+    plotly_report(out, vo.steps, P, C, estado, t0_host, name, dense, planes)
     print("Renderizando animación paso a paso...")
-    render_animation(out, vo, args.fps_anim, args.gif_frames, args.gif_width)
+    cloud = dense[:3] if dense is not None else vo.sparse_cloud_with_owner()
+    render_animation(
+        out, vo, cloud, args.fps_anim, args.gif_frames, args.gif_width
+    )
     info = {
         "sesion": name,
         "video": str(video),
@@ -1053,6 +1418,9 @@ def main():
         "fotogramas_procesados": n,
         "keyframes": len(vo.steps),
         "puntos_3d": int(len(P)),
+        "puntos_densos": int(len(dense[0])) if dense is not None else 0,
+        "planos": len(planes) if planes is not None else 0,
+        "saltos_rotacion_imu": int(sum(s.rot_imu for s in vo.steps)),
         "estados": {k: estados.count(k) for k in set(estados)},
         "parametros": {
             k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
