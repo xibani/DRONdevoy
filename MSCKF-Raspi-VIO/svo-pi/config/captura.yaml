@@ -1,0 +1,66 @@
+# =====================================================================
+# config/captura.yaml — Parámetros de la Fase 1 (adquisición)
+# Lo leen captura/grabar.py y captura/verificar.py
+# =====================================================================
+
+imu:
+  chip: MPU-6050
+  bus_i2c: 1                 # /dev/i2c-1 (pines GPIO2/GPIO3)
+  direccion: 0x68            # AD0 a masa
+  who_am_i_esperado: 0x68    # el MPU-6050 auténtico responde 0x68
+
+  # Frecuencia de salida = 1000 Hz / (1 + smplrt_div)   (con DLPF activo)
+  smplrt_div: 4
+  frecuencia_hz: 200
+
+  # Filtro paso bajo digital (registro CONFIG):
+  #   3 -> ancho de banda acel 44 Hz / gir 42 Hz, retardo ~4.8 ms
+  # Evita aliasing de vibraciones por encima de Nyquist (100 Hz).
+  # El retardo queda absorbido en el t_d que estime Kalibr (F2).
+  dlpf_cfg: 3
+  dlpf_retraso_ms: 4.8
+
+  # Rangos (registros GYRO_CONFIG / ACCEL_CONFIG, bits 4:3)
+  gyro_config: 0x08          # ±500 °/s
+  escala_gir_lsb_por_dps: 65.5
+  accel_config: 0x08         # ±4 g
+  escala_acc_lsb_por_g: 8192.0
+
+  nucleo_cpu: 3              # núcleo reservado al proceso de la IMU
+  timeout_arranque_s: 5.0
+
+camara:
+  sensor: ov5647
+  obturador: rodante
+  ancho: 640                 # modo binned 640x480 (campo de visión completo, hasta 62.5 fps)
+  alto: 480
+  profundidad_bits: 10
+  fps: 20
+  buffers: 6
+
+  # Exposición: se deja converger el AE y luego se congela (AE y AWB off)
+  t_ajuste_ae_s: 2.0
+  t_aplicar_controles_s: 0.5
+  exposicion_max_us: 8000    # límite para acotar el emborronamiento por movimiento
+  ganancia_max: 16.0
+
+  compresion_png: 1          # 0-9; 1 = rápida (PNG siempre sin pérdidas)
+  cola_max_imagenes: 300     # ~15 s de margen a 20 fps si el disco se atasca
+
+grabacion:
+  carpeta_salida: datos
+  aviso_cada_s: 1.0
+
+verificacion:
+  t_reposo_s: 2.0            # segundos iniciales de IMU que se suponen en reposo
+  factor_hueco: 1.5          # un intervalo > 1.5·T nominal cuenta como hueco
+  latencia_max_ms: 500.0     # llegada - sensor por encima de esto: relojes distintos
+  ruido_gir_max_dps: 0.5     # desv. típica en reposo por encima de esto: no estaba quieto
+  g: 9.80665
+
+  # Criterio de salida de F1
+  criterio:
+    duracion_min_s: 60.0
+    imagenes_perdidas_max: 0
+    imu_perdidas_max_pct: 0.1
+    imu_jitter_max_ms: 0.5   # desviación típica de Δt de la IMU

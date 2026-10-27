@@ -1,0 +1,27 @@
+# =====================================================================
+# config/hito_giro.yaml — Hito 1: orientación solo con giroscopio, Pi -> PC
+# Lo leen apps/pi_orientacion.py (Pi) y apps/pc_visor.py (PC).
+# Los parámetros de la IMU siguen en config/captura.yaml.
+# =====================================================================
+
+inicializacion:
+  t_reposo_s: 2.0               # tramo inicial quieto para estimar b_g y la inclinación
+  sigma_gir_max_dps: 0.5        # si σ del giroscopio supera esto, se movió: reiniciar
+  error_norma_acc_max: 0.5      # | ‖ā‖ - g | máximo admitido en reposo [m/s²]
+  g: 9.80665
+
+integracion:
+  reortonormalizar_cada: 200    # muestras entre proyecciones de R sobre SO(3)
+  dt_max_s: 0.05                # Δt mayor que esto se cuenta como hueco (se integra igual)
+
+red:
+  ip_destino: 192.168.1.100     # IP del PC en la red local ([Windows PowerShell] ipconfig)
+  puerto: 5005
+  frecuencia_envio_hz: 30       # se integra a 200 Hz, se envía a esta frecuencia
+
+visor:
+  intervalo_refresco_ms: 50
+  ventana_historia_s: 60
+  timeout_sin_datos_s: 1.0
+  semiejes_caja: [1.0, 0.6, 0.12]   # tamaño del dibujo de la placa (x, y, z), sin unidades
+  longitud_ejes: 1.6
